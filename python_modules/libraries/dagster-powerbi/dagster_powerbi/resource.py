@@ -166,12 +166,15 @@ class PowerBIWorkspace(ConfigurableResource):
     @public
     def trigger_and_poll_refresh(self, dataset_id: str) -> None:
         """Triggers a refresh of a PowerBI dataset and polls until it completes or fails."""
-        self.trigger_refresh(dataset_id)
-        self.poll_refresh(dataset_id)
+        request_id = self.trigger_refresh(dataset_id)
+        self.poll_refresh(dataset_id, request_id=request_id)
 
     @public
-    def trigger_refresh(self, dataset_id: str) -> None:
-        """Triggers a refresh of a PowerBI dataset."""
+    def trigger_refresh(self, dataset_id: str) -> str:
+        """Triggers a refresh of a PowerBI dataset and returns the request ID
+        identifying that refresh, which can be passed to `poll_refresh` to
+        unambiguously poll the status of this specific refresh.
+        """
         response = self._fetch(
             method="POST",
             endpoint=f"datasets/{dataset_id}/refreshes",
@@ -180,10 +183,19 @@ class PowerBIWorkspace(ConfigurableResource):
         )
         if response.status_code != 202:
             raise Failure(f"Refresh failed to start: {response.content}")
+        return response.headers["x-ms-request-id"]
 
     @public
-    def poll_refresh(self, dataset_id: str) -> None:
-        """Polls the refresh status of a PowerBI dataset until it completes or fails."""
+    def poll_refresh(self, dataset_id: str, request_id: str | None = None) -> None:
+        """Polls the refresh status of a PowerBI dataset until it completes or fails.
+
+        Args:
+            dataset_id (str): The ID of the dataset to poll.
+            request_id (Optional[str]): The request ID of the refresh to poll, as returned
+                by `trigger_refresh`. If not provided, polls the most recently started
+                refresh, which is subject to a race condition if another refresh is
+                triggered concurrently.
+        """
         status = None
 
         start = time.monotonic()
@@ -191,10 +203,16 @@ class PowerBIWorkspace(ConfigurableResource):
             if time.monotonic() - start > self.refresh_timeout:
                 raise Failure(f"Refresh timed out after {self.refresh_timeout} seconds.")
 
-            last_refresh = self._fetch_json(
-                f"datasets/{dataset_id}/refreshes",
-                group_scoped=True,
-            )["value"][0]
+            if request_id:
+                last_refresh = self._fetch_json(
+                    f"datasets/{dataset_id}/refreshes/{request_id}",
+                    group_scoped=True,
+                )
+            else:
+                last_refresh = self._fetch_json(
+                    f"datasets/{dataset_id}/refreshes",
+                    group_scoped=True,
+                )["value"][0]
             status = last_refresh["status"]
 
             time.sleep(self.refresh_poll_interval)
