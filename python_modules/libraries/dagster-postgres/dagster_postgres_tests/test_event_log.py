@@ -1,9 +1,11 @@
 import gc
+import select
 import time
 from contextlib import contextmanager
 from unittest.mock import patch
 
 import objgraph
+import psycopg2
 import pytest
 from dagster import AssetKey, AssetMaterialization, EventLogEntry
 from dagster._core.events import (
@@ -16,11 +18,13 @@ from dagster._core.instance import RUNLESS_JOB_NAME, RUNLESS_RUN_ID
 from dagster._core.storage.event_log.base import EventLogCursor
 from dagster._core.storage.event_log.migration import ASSET_KEY_INDEX_COLS
 from dagster._core.storage.event_log.schema import SecondaryIndexMigrationTable
+from dagster._core.storage.sqlalchemy_compat import IS_SQLALCHEMY_VERSION_1
 from dagster._core.test_utils import ensure_dagster_tests_import, instance_for_test
 from dagster._core.utils import make_new_run_id
 from dagster_postgres.event_log import PostgresEventLogStorage
 from dagster_shared.yaml_utils import safe_load_yaml
 from sqlalchemy.engine import Connection
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.pool import QueuePool
 
 ensure_dagster_tests_import()
@@ -234,3 +238,37 @@ def test_all_asset_keys_excludes_wiped_asset_on_legacy_index_path(conn_string):
 
         assert asset_key not in storage.all_asset_keys()
         assert storage.get_latest_materialization_events([asset_key]).get(asset_key) is None
+
+
+def test_store_event_sends_notification(conn_string):
+    # store_event still notifies LISTENers so that older versions can watch for new events
+    url = make_url(conn_string)
+    listen_conn = psycopg2.connect(
+        host=url.host, port=url.port, user=url.username, password=url.password, dbname=url.database
+    )
+    try:
+        listen_conn.autocommit = True
+        listen_conn.cursor().execute("LISTEN run_events")
+        with _clean_storage(conn_string) as storage:
+            run_id = make_new_run_id()
+            storage.store_event(create_test_event_log_record("1", run_id=run_id))
+            [record] = storage.get_records_for_run(run_id).records
+
+        deadline = time.time() + 5
+        while not listen_conn.notifies and time.time() < deadline:
+            select.select([listen_conn], [], [], 0.1)
+            listen_conn.poll()
+        assert [n.payload for n in listen_conn.notifies] == [f"{run_id}_{record.storage_id}"]
+    finally:
+        listen_conn.close()
+
+
+@pytest.mark.skipif(IS_SQLALCHEMY_VERSION_1, reason="psycopg 3 dialect requires sqlalchemy 2")
+def test_store_event_with_psycopg3(conn_string):
+    # NOTIFY does not accept bind parameters, which fails under psycopg 3's server-side binding
+    pytest.importorskip("psycopg")
+    psycopg3_url = "postgresql+psycopg" + conn_string[conn_string.index("://") :]
+    with _clean_storage(psycopg3_url) as storage:
+        run_id = make_new_run_id()
+        storage.store_event(create_test_event_log_record("1", run_id=run_id))
+        assert len(storage.get_logs_for_run(run_id)) == 1
