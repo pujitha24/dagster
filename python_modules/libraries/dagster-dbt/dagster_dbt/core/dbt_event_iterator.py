@@ -155,6 +155,9 @@ def _fetch_row_count_metadata(
     if not isinstance(event, (AssetMaterialization, Output)):
         return None
 
+    check.invariant(
+        invocation.cli_version.major < 2, "Row count metadata not supported for dbt Fusion."
+    )
     adapter = check.not_none(invocation.adapter)
 
     dbt_resource_props = _get_dbt_resource_props_from_event(invocation, event)
@@ -252,7 +255,8 @@ class DbtEventIterator(Iterator[T]):
                 yielded in the order they are emitted by dbt.
         """
         check.invariant(
-            DBT_PYTHON_VERSION is not None, "Column metadata not supported for dbt Fusion."
+            DBT_PYTHON_VERSION is not None and self._dbt_cli_invocation.cli_version.major < 2,
+            "Column metadata not supported for dbt Fusion.",
         )
         fetch_metadata = lambda invocation, event: _fetch_column_metadata(
             invocation, event, with_column_lineage

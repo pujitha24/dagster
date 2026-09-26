@@ -10,13 +10,14 @@ from dagster import (
     _check as check,
     materialize,
 )
-from dagster._core.definitions.events import AssetMaterialization, Output
+from dagster._core.definitions.events import AssetMaterialization, AssetObservation, Output
 from dagster._core.definitions.metadata.metadata_value import MetadataValue, TableMetadataValue
 from dagster._core.definitions.metadata.table import TableRecord
 from dagster_dbt.asset_decorator import dbt_assets
 from dagster_dbt.core.dbt_cli_invocation import DbtCliInvocation, DbtDagsterEventType
-from dagster_dbt.core.dbt_event_iterator import _get_dbt_resource_props_from_event
+from dagster_dbt.core.dbt_event_iterator import DbtEventIterator, _get_dbt_resource_props_from_event
 from dagster_dbt.core.resource import DbtCliResource
+from packaging import version
 
 from dagster_dbt_tests.conftest import _create_dbt_invocation
 from dagster_dbt_tests.dbt_projects import test_jaffle_shop_path
@@ -390,3 +391,35 @@ def test_row_count_with_relative_path_in_profile(
             test_file.unlink()
         if config_dir.exists() and not any(config_dir.iterdir()):
             config_dir.rmdir()
+
+
+def _mock_invocation(cli_version: str) -> DbtCliInvocation:
+    return mock.MagicMock(
+        spec=DbtCliInvocation,
+        cli_version=version.Version(cli_version),
+        adapter=None,
+        postprocessing_threadpool_num_threads=1,
+    )
+
+
+def test_row_count_not_supported_for_fusion() -> None:
+    fusion_invocation = _mock_invocation("2.0.0")
+
+    # Events that row counts are not fetched for pass through unchanged
+    observation = AssetObservation(asset_key="my_model")
+    events = DbtEventIterator(iter([observation]), dbt_cli_invocation=fusion_invocation)
+    assert list(events.fetch_row_counts()) == [observation]
+
+    materialization = AssetMaterialization(asset_key="my_model")
+    events = DbtEventIterator(iter([materialization]), dbt_cli_invocation=fusion_invocation)
+    with pytest.raises(check.CheckError, match="Row count metadata not supported for dbt Fusion"):
+        list(events.fetch_row_counts())
+
+
+def test_column_metadata_not_supported_for_fusion() -> None:
+    events = DbtEventIterator(iter([]), dbt_cli_invocation=_mock_invocation("2.0.0"))
+    with pytest.raises(check.CheckError, match="Column metadata not supported for dbt Fusion"):
+        events.fetch_column_metadata()
+
+    events = DbtEventIterator(iter([]), dbt_cli_invocation=_mock_invocation("1.9.0"))
+    assert list(events.fetch_column_metadata()) == []
